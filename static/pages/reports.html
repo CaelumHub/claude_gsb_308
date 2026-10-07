@@ -130,7 +130,7 @@ function renderReport(r) {
     </div>
     <div class="mt row">
       ${statusBadge(r.status)}
-      <span class="muted" style="font-size:13px">触发 ${esc(r.trigger||'manual')} · ${fmtTime(r.started_at)} → ${fmtTime(r.finished_at)}</span>
+      <span class="muted" style="font-size:13px">触发 ${esc(triggerLabel(r.trigger))} · ${fmtTime(r.started_at)} → ${fmtTime(r.finished_at)}</span>
     </div>
     <div class="mt grid cols-4">
       <div class="stat"><div class="v">${fmtDur(d.avg)}</div><div class="k">平均耗时</div></div>

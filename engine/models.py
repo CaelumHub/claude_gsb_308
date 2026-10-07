@@ -22,7 +22,15 @@ DEFECT_STATUSES = ["open", "in_progress", "fixed", "verified", "closed", "reopen
 INTEGRATION_TYPES = ["webhook", "slack", "email", "dingtalk"]
 
 # 触发来源
-TRIGGER_TYPES = ["manual", "schedule", "webhook", "ci"]
+TRIGGER_TYPES = ["manual", "schedule", "schedule_catchup", "webhook", "ci"]
+
+# 定时计划「错过触发」的补偿策略：
+# - catch_up    恢复后立即补跑一次（合并所有错过的触发点）
+# - mark_missed 不补跑，记录一条「已错过」的运行历史，绝不悄悄跳过
+MISFIRE_POLICIES = ["catch_up", "mark_missed"]
+
+# 定时计划运行历史的状态
+SCHEDULE_RUN_STATUSES = ["submitted", "caught_up", "missed", "submit_failed"]
 
 
 def new_id(prefix: str) -> str:

@@ -9,8 +9,13 @@
    用例，用 ``max_case_workers`` 限制单构建内的并发度；结果通过
    :meth:`storage.buildstore.BuildStore.record_result` 在文件锁保护下
    并发安全地收集与聚合；
-3. **定时触发**：一个后台循环线程按 ``tick`` 间隔扫描启用的定时计划，
-   命中 cron 且本分钟尚未触发过就提交新构建，防止同一分钟重复触发。
+3. **定时触发**：每条计划绑定自己的 IANA 时区，cron 按该时区的墙上时间
+   解释；计划持久化一个 ``next_fire_at``（UTC 时间戳），后台循环按
+   ``tick`` 间隔扫描，到点即触发并推进 ``next_fire_at``，天然不会同一
+   分钟重复触发。若系统停机错过了触发点，恢复后按计划的
+   ``misfire_policy`` 处理：``catch_up`` 立即补跑一次（合并所有错过），
+   ``mark_missed`` 记录一条「已错过」历史——绝不悄悄跳过。夏令时行为见
+   :mod:`engine.cron` 的约定（重叠取第一次、不存在则顺延）。
 
 取消：每个构建持有一个 ``threading.Event``，用例执行器在步骤之间检查它，
 取消后已在跑或用例尽快中止、未跑的不再启动，最终构建标为 ``cancelled``。
@@ -18,13 +23,12 @@
 
 from __future__ import annotations
 
-import datetime
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
-from .cron import cron_matches, parse_cron
+from .cron import local_timezone_name, next_fire_timestamp, parse_cron
 from .models import new_id
 
 
@@ -34,7 +38,7 @@ class Scheduler:
     def __init__(self, registry, build_registry, executor, env_manager,
                  report_gen, coverage_analyzer, defect_manager, notify_manager,
                  max_build_workers: int = 4, max_case_workers: int = 8,
-                 tick_seconds: float = 20.0):
+                 tick_seconds: float = 20.0, misfire_threshold: float = 120.0):
         self.registry = registry
         self.builds = build_registry
         self.executor = executor
@@ -47,6 +51,10 @@ class Scheduler:
         self.max_build_workers = max_build_workers
         self.max_case_workers = max_case_workers
         self.tick_seconds = tick_seconds
+        # 到点判定宽限：触发点距今不超过该秒数视为「正常到点」；超过则
+        # 认定为停机/卡顿造成的错过，走 misfire_policy 补偿。必须大于
+        # tick_seconds，否则正常 tick 抖动会被误判为错过。
+        self.misfire_threshold = misfire_threshold
 
         self._build_pool = ThreadPoolExecutor(
             max_workers=max_build_workers, thread_name_prefix="build")
@@ -70,8 +78,7 @@ class Scheduler:
 
     # ------------------------------------------------------------------ 触发
     def submit_build(self, project_id: str, suite_id: str,
-                     env_id: Optional[str] = None, trigger: str = "manual",
-                     schedule_id: Optional[str] = None) -> dict:
+                     env_id: Optional[str] = None, trigger: str = "manual") -> dict:
         """提交一场构建，立即返回构建元信息（构建在后台线程池运行）。"""
         suites = self.registry.store("suites")
         cases_store = self.registry.store("cases")
@@ -113,10 +120,6 @@ class Scheduler:
 
         self._build_pool.submit(
             self._run_build, project_id, build_id, cases, env_id, cancel_event)
-
-        # 若是定时触发，记录一次计划运行历史
-        if schedule_id:
-            self._record_schedule_run(schedule_id, project_id, build_id)
 
         return build
 
@@ -282,45 +285,124 @@ class Scheduler:
                 pass
             self._stop_event.wait(self.tick_seconds)
 
-    def _scan_schedules(self) -> None:
+    def _scan_schedules(self, now_ts: Optional[float] = None) -> None:
         # 串行化扫描，避免多个线程（后台 tick + 手动触发）同时读到
-        # 「本分钟尚未触发」而重复触发同一计划。
+        # 「同一触发点未到」而重复触发同一计划。
         with self._scan_lock:
-            self._scan_schedules_locked()
+            self._scan_schedules_locked(now_ts)
 
-    def _scan_schedules_locked(self) -> None:
-        now = datetime.datetime.now()
-        minute_key = now.strftime("%Y-%m-%d %H:%M")
+    def _scan_schedules_locked(self, now_ts: Optional[float] = None) -> None:
+        """扫描所有启用的计划，触发到点的构建并处理错过补偿。
+
+        ``now_ts`` 可注入（测试用），默认取当前时间。判定完全基于计划上
+        持久化的 ``next_fire_at``（UTC 时间戳），与服务器本地时区无关。
+        """
+        now_ts = time.time() if now_ts is None else now_ts
         schedules_store = self.registry.store("schedules")
         for schedule in schedules_store.all():
             if not schedule.get("enabled", True):
                 continue
-            if schedule.get("last_fired_minute") == minute_key:
-                continue  # 本分钟已触发过，防止同一分钟重复
+            tz_name = schedule.get("timezone") or local_timezone_name()
+            cron = schedule.get("cron", "* * * * *")
             try:
-                if cron_matches(schedule.get("cron", "* * * * *"), now):
-                    schedule["last_fired_minute"] = minute_key
-                    schedules_store.update(schedule["id"], {"last_fired_minute": minute_key})
-                    self.submit_build(
-                        schedule.get("project_id"),
-                        schedule.get("suite_id"),
-                        env_id=schedule.get("env_id"),
-                        trigger="schedule",
-                        schedule_id=schedule["id"],
-                    )
+                due_at = schedule.get("next_fire_at")
+                if due_at is None:
+                    # 新计划（或老数据迁移）：先落一个未来的触发点，不补历史
+                    nxt = next_fire_timestamp(cron, tz_name, now_ts)
+                    schedules_store.update(schedule["id"], {"next_fire_at": nxt})
+                    continue
+                if now_ts < due_at:
+                    continue  # 未到点
+                self._fire_due(schedule, tz_name, due_at, now_ts)
             except ValueError:
-                continue
+                continue  # 表达式 / 时区非法（创建时已校验，防御性跳过）
 
-    def _record_schedule_run(self, schedule_id: str, project_id: str,
-                             build_id: str) -> None:
-        self.registry.store("schedule_runs").insert({
+    def _fire_due(self, schedule: dict, tz_name: str, due_at: float,
+                  now_ts: float) -> None:
+        """处理一个已到触发点的计划：正常触发或按策略补偿错过。"""
+        sid = schedule["id"]
+        cron = schedule.get("cron", "* * * * *")
+        store = self.registry.store("schedules")
+
+        if now_ts - due_at <= self.misfire_threshold:
+            # 正常到点：触发一次，并把下一个触发点推到本次之后（无损推进，
+            # 即便 tick 抖动跨过下一个触发点，下个扫描周期也会补上）。
+            build = self.submit_build(
+                schedule.get("project_id"), schedule.get("suite_id"),
+                env_id=schedule.get("env_id"), trigger="schedule")
+            self._record_run_from_build(schedule, build, status="submitted",
+                                        scheduled_at=due_at)
+            store.update(sid, {"next_fire_at": next_fire_timestamp(cron, tz_name, due_at),
+                               "last_fired_at": now_ts})
+            return
+
+        # ---- 错过（停机 / 严重卡顿）：统计 [due_at, now_ts] 内所有触发点 ----
+        missed = [due_at]
+        cursor = due_at
+        truncated = False
+        while len(missed) < 5000:  # 上限保护：超长停机不让扫描循环失控
+            nxt = next_fire_timestamp(cron, tz_name, cursor)
+            if nxt is None or nxt > now_ts:
+                break
+            missed.append(nxt)
+            cursor = nxt
+        else:
+            truncated = True
+
+        policy = schedule.get("misfire_policy") or "catch_up"
+        patch = {}
+        if policy == "catch_up":
+            # 补跑一次：合并所有错过的触发点，立即补跑最近的一次
+            build = self.submit_build(
+                schedule.get("project_id"), schedule.get("suite_id"),
+                env_id=schedule.get("env_id"), trigger="schedule_catchup")
+            self._record_run_from_build(
+                schedule, build, status="caught_up", scheduled_at=missed[-1],
+                missed_count=len(missed) - 1, missed_truncated=truncated)
+            patch["last_fired_at"] = now_ts
+        else:
+            # 标记为已错过：不补跑，留一条明确的错过记录
+            self._record_schedule_run(
+                sid, schedule.get("project_id"), None, status="missed",
+                scheduled_at=missed[0], window_end=missed[-1],
+                missed_count=len(missed), missed_truncated=truncated)
+            patch["last_missed_at"] = now_ts
+
+        # 错过窗口内的触发点已按策略清算完毕，从当前时刻重新排程
+        patch["next_fire_at"] = next_fire_timestamp(cron, tz_name, now_ts)
+        store.update(sid, patch)
+
+    def _record_run_from_build(self, schedule: dict, build: dict,
+                               status: str, **extra) -> None:
+        """按构建提交结果记录计划运行历史（提交失败也留痕）。"""
+        if "id" in build:
+            self._record_schedule_run(schedule["id"], schedule.get("project_id"),
+                                      build["id"], status=status, **extra)
+        else:
+            self._record_schedule_run(schedule["id"], schedule.get("project_id"),
+                                      None, status="submit_failed",
+                                      error=build.get("error", "提交构建失败"),
+                                      **extra)
+
+    def _record_schedule_run(self, schedule_id: str, project_id: Optional[str],
+                             build_id: Optional[str], status: str = "submitted",
+                             **extra) -> None:
+        run = {
             "id": new_id("schrun"),
             "schedule_id": schedule_id,
             "project_id": project_id,
             "build_id": build_id,
             "fired_at": time.time(),
-            "status": "submitted",
-        })
+            "status": status,
+        }
+        run.update(extra)
+        self.registry.store("schedule_runs").insert(run)
+
+    def compute_next_fire(self, cron: str, tz_name: str,
+                          after_ts: Optional[float] = None) -> Optional[float]:
+        """计算某 cron 计划在指定时区下、``after_ts``（默认现在）之后的
+        下次触发 UTC 时间戳；地平线内找不到返回 ``None``。"""
+        return next_fire_timestamp(cron, tz_name, after_ts or time.time())
 
     def describe_cron(self, expr: str) -> str:
         """把 cron 表达式转成人话（供前端展示）。"""

@@ -27,6 +27,15 @@ const STATUS_LABELS = {
   cancelled: "已取消", error: "错误", skipped: "跳过", timeout: "超时",
 };
 
+const TRIGGER_LABELS = {
+  manual: "手动", schedule: "定时", schedule_catchup: "定时补跑",
+  webhook: "Webhook", ci: "CI", auto_seed: "演示",
+};
+
+function triggerLabel(t) {
+  return TRIGGER_LABELS[t] || t || "手动";
+}
+
 const PRIORITY_LABELS = { P0: "P0 · 最高", P1: "P1 · 高", P2: "P2 · 中", P3: "P3 · 低" };
 
 /* ---------- 导航注入 ---------- */

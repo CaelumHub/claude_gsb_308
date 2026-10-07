@@ -125,7 +125,7 @@ async function poll() {
     $("#live-meta").innerHTML = `
       <div class="row mt">${statusBadge(b.status)}
         <span class="muted" style="font-size:13px">通过 <strong>${b.passed||0}</strong> / 失败 <strong style="color:var(--red)">${(b.failed||0)+(b.error||0)+(b.timeout||0)}</strong> / 共 ${total}</span>
-        <span class="muted mono" style="font-size:12px">触发: ${esc(b.trigger||'manual')} · ${fmtTime(b.started_at)}</span>
+        <span class="muted mono" style="font-size:12px">触发: ${esc(triggerLabel(b.trigger))} · ${fmtTime(b.started_at)}</span>
       </div>
       ${progressBar(total ? done/total : 0, b.status==='passed'?'green':(b.status==='failed'||b.status==='error'?'red':''))}`;
     const running = b.status === "running" || b.status === "pending";

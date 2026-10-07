@@ -17,7 +17,7 @@
 
   <main class="main">
     <h1 class="page-title">定时任务与触发</h1>
-    <p class="page-desc">用 cron 表达式配置定时自动执行测试，到点触发、同一分钟不重复。</p>
+    <p class="page-desc">每条计划绑定自己的时区，cron 按该时区墙上时间触发；停机错过按计划策略补跑或标记，绝不悄悄跳过。</p>
 
     <div class="card">
       <div class="row">
@@ -47,6 +47,19 @@
           <div><label>目标套件</label><select id="s-suite"></select></div>
           <div><label>执行环境</label><select id="s-env"><option value="">— 默认 —</option></select></div>
         </div>
+        <div class="grid cols-2 mt">
+          <div><label>触发时区（cron 按该时区墙上时间解释）</label>
+            <select id="s-timezone"></select>
+            <div class="muted" style="font-size:12px;margin-top:4px" id="tz-hint"></div>
+          </div>
+          <div><label>错过补偿策略（停机恢复后）</label>
+            <select id="s-misfire">
+              <option value="catch_up">补跑一次 —— 恢复后立即补跑最近的一次</option>
+              <option value="mark_missed">标记为已错过 —— 不补跑，记录错过历史</option>
+            </select>
+            <div class="muted" style="font-size:12px;margin-top:4px">夏令时：重叠时刻只触发一次，不存在的时刻顺延到之后第一个有效时刻。</div>
+          </div>
+        </div>
         <div class="mt">
           <label style="display:inline-flex;gap:6px;font-weight:400;color:var(--text);align-items:center">
             <input type="checkbox" id="s-enabled" checked style="width:auto"> 启用
@@ -68,11 +81,22 @@ renderNav("schedules");
 let projectId = null;
 let schedules = [];
 let editingId = null;
+let serverTz = "";
+let preferredTz = "";
+
+const RUN_STATUS = {
+  submitted: { label: "已触发", cls: "blue" },
+  caught_up: { label: "补跑", cls: "timeout" },
+  missed: { label: "已错过", cls: "failed" },
+  submit_failed: { label: "提交失败", cls: "failed" },
+};
+const POLICY_LABELS = { catch_up: "补跑一次", mark_missed: "标记为已错过" };
+const browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone || "本地";
 
 async function init() {
   const params = new URLSearchParams(location.search);
   projectId = await fillProjectSelect($("#project-select"), params.get("project_id"));
-  await Promise.all([loadSchedules(), loadRefs()]);
+  await Promise.all([loadSchedules(), loadRefs(), loadTimezones()]);
 }
 
 async function switchProject(id) { projectId = id; editingId = null; await Promise.all([loadSchedules(), loadRefs()]); }
@@ -88,16 +112,57 @@ async function loadRefs() {
     (envs.environments||[]).map(e => `<option value="${e.id}">${esc(e.name)}</option>`).join("");
 }
 
+async function loadTimezones() {
+  const d = await api("/api/timezones");
+  serverTz = d.server_timezone || "";
+  const zones = d.timezones || [];
+  // 优先选中浏览器所在时区（跨国团队各看各的），其次服务器时区
+  preferredTz = zones.includes(browserTz) ? browserTz : serverTz;
+  $("#s-timezone").innerHTML = zones.map(z =>
+    `<option value="${esc(z)}" ${z === preferredTz ? "selected" : ""}>${esc(z)}${z === serverTz ? "（服务器）" : ""}</option>`).join("");
+  $("#tz-hint").textContent = `服务器时区：${serverTz} · 浏览器时区：${browserTz}`;
+}
+
+/* 把时间戳格式化成指定 IANA 时区的墙上时间 */
+function fmtInTz(ts, tz) {
+  if (!ts) return "—";
+  try {
+    return new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false, timeZone: tz });
+  } catch (_) { return fmtTime(ts); }
+}
+
+function runBadge(r) {
+  const meta = RUN_STATUS[r.status] || { label: r.status || "已触发", cls: "blue" };
+  let extra = "";
+  if (r.status === "caught_up" && r.missed_count) extra = `（合并 ${r.missed_count} 次错过）`;
+  if (r.status === "missed" && r.missed_count) extra = `（共 ${r.missed_count} 次）`;
+  return `<span class="badge ${meta.cls}">${meta.label}</span>${extra}`;
+}
+
 async function loadSchedules() {
   const d = await api(`/api/projects/${projectId}/schedules`);
   schedules = d.schedules || [];
+  serverTz = d.server_timezone || serverTz;
   const host = $("#sch-list");
   if (!schedules.length) { host.innerHTML = '<div class="empty">暂无定时任务</div>'; return; }
-  host.innerHTML = schedules.map(s => `
+  host.innerHTML = schedules.map(s => {
+    const sameTz = s.timezone === browserTz;
+    const nextTz = fmtInTz(s.next_fire_at, s.timezone);
+    const nextLocal = fmtTime(s.next_fire_at);
+    const nextHtml = s.enabled === false
+      ? '<span class="muted">已停用</span>'
+      : (sameTz
+        ? `<strong>${esc(nextTz)}</strong> <span class="muted">(${esc(s.timezone)})</span>`
+        : `<strong>${esc(nextTz)}</strong> <span class="muted">(${esc(s.timezone)})</span> · 本地 <strong>${esc(nextLocal)}</strong> <span class="muted">(${esc(browserTz)})</span>`);
+    const runs = (s.recent_runs || []).slice(0, 5).map(r =>
+      `<div style="font-size:12px;color:var(--text-muted)">${runBadge(r)} ${fmtTime(r.fired_at)}</div>`).join("");
+    return `
     <div class="sch-item">
       <div class="row spread">
         <div class="row"><strong>${esc(s.name)}</strong>
-          <span class="badge ${s.enabled?'blue':'pending'}">${s.enabled?'已启用':'已停用'}</span></div>
+          <span class="badge ${s.enabled?'blue':'pending'}">${s.enabled?'已启用':'已停用'}</span>
+          <span class="tag">${esc(s.timezone)}</span>
+          <span class="tag">错过：${esc(POLICY_LABELS[s.misfire_policy] || s.misfire_policy)}</span></div>
         <div class="row">
           <button class="btn small secondary" onclick="toggle('${s.id}', ${!s.enabled})">${s.enabled?'停用':'启用'}</button>
           <button class="btn small secondary" onclick="editSch('${s.id}')">编辑</button>
@@ -106,9 +171,12 @@ async function loadSchedules() {
       </div>
       <div class="cron-box mt">${esc(s.cron)}</div>
       <div class="mt muted" style="font-size:13px">${esc(s.description||"")}</div>
-      <div class="mt" style="font-size:12px;color:var(--text-muted)">上次触发: ${s.last_fired_minute?esc(s.last_fired_minute):"—"} ·
+      <div class="mt" style="font-size:13px">下次触发：${nextHtml}</div>
+      <div class="mt" style="font-size:12px;color:var(--text-muted)">上次触发: ${s.last_fired_at?fmtTime(s.last_fired_at):"—"} ·
         最近执行: ${(s.recent_runs||[]).length} 次</div>
-    </div>`).join("");
+      ${runs ? `<div class="mt">${runs}</div>` : ""}
+    </div>`;
+  }).join("");
 }
 
 function newSch() {
@@ -116,6 +184,8 @@ function newSch() {
   $("#edit-title").textContent = "新建定时任务";
   $("#s-name").value = ""; $("#s-cron").value = "*/10 * * * *"; $("#s-enabled").checked = true;
   $("#s-suite").value = ""; $("#s-env").value = "";
+  $("#s-timezone").value = preferredTz || serverTz;
+  $("#s-misfire").value = "catch_up";
   previewCron();
 }
 
@@ -126,6 +196,8 @@ function editSch(id) {
   $("#edit-title").textContent = "编辑定时任务";
   $("#s-name").value = s.name || ""; $("#s-cron").value = s.cron || ""; $("#s-enabled").checked = s.enabled !== false;
   $("#s-suite").value = s.suite_id || ""; $("#s-env").value = s.env_id || "";
+  if (s.timezone) $("#s-timezone").value = s.timezone;
+  $("#s-misfire").value = s.misfire_policy || "catch_up";
   previewCron();
 }
 
@@ -160,7 +232,8 @@ $("#btn-save").onclick = async () => {
   const suiteId = $("#s-suite").value;
   if (!suiteId) return toast("请选择目标套件", "error");
   const body = { name: $("#s-name").value || "定时任务", cron, suite_id: suiteId,
-    env_id: $("#s-env").value || null, enabled: $("#s-enabled").checked };
+    env_id: $("#s-env").value || null, enabled: $("#s-enabled").checked,
+    timezone: $("#s-timezone").value, misfire_policy: $("#s-misfire").value };
   try {
     if (editingId) {
       await api(`/api/schedules/${editingId}`, { method: "PUT", body });

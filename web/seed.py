@@ -120,10 +120,13 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         "project_id": pid,
         "name": "每 10 分钟跑一次冒烟",
         "cron": "*/10 * * * *",
+        "timezone": "Asia/Shanghai",
+        "misfire_policy": "catch_up",
         "suite_id": suite["id"],
         "env_id": env["id"],
         "enabled": False,
-        "last_fired_minute": None,
+        "next_fire_at": None,
+        "last_fired_at": None,
         "created_at": time.time(),
     })
 

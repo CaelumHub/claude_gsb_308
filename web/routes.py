@@ -15,7 +15,7 @@ from typing import Optional
 
 from flask import Blueprint, current_app, jsonify, request
 
-from engine import new_id
+from engine import MISFIRE_POLICIES, new_id
 from engine.executor import TestExecutor
 
 api = Blueprint("api", __name__, url_prefix="/api")
@@ -569,59 +569,104 @@ def resolve_environment(env_id: str):
 # 定时任务与触发
 # ---------------------------------------------------------------------------
 
+def _enrich_schedule(s: dict) -> dict:
+    """给计划记录补充展示字段：描述、下次触发点、最近运行历史。"""
+    from engine.cron import local_timezone_name, next_fire_timestamp
+    s["timezone"] = s.get("timezone") or local_timezone_name()
+    s["misfire_policy"] = s.get("misfire_policy") or "catch_up"
+    next_fire_at = s.get("next_fire_at")
+    if next_fire_at is None and s.get("enabled", True):
+        # 老数据 / 新计划尚未被扫描过：即时算一个，只读不写
+        try:
+            next_fire_at = next_fire_timestamp(s.get("cron", ""), s["timezone"],
+                                               time.time())
+        except ValueError:
+            next_fire_at = None
+    s["next_fire_at"] = next_fire_at
+    s["description"] = _scheduler().describe_cron(s.get("cron", ""))
+    s["recent_runs"] = _store("schedule_runs").query(
+        where=[("schedule_id", "eq", s["id"])],
+        order_by="fired_at", order="desc", limit=10)
+    return s
+
+
 @api.get("/projects/<project_id>/schedules")
 def list_schedules(project_id: str):
+    from engine.cron import local_timezone_name
     schedules = _store("schedules").query(where=[("project_id", "eq", project_id)],
                                           order_by="created_at", order="desc")
-    for s in schedules:
-        s["description"] = _scheduler().describe_cron(s.get("cron", ""))
-        runs = _store("schedule_runs").query(where=[("schedule_id", "eq", s["id"])],
-                                             order_by="fired_at", order="desc", limit=10)
-        s["recent_runs"] = runs
-    return jsonify({"schedules": schedules})
+    return jsonify({
+        "schedules": [_enrich_schedule(s) for s in schedules],
+        "server_timezone": local_timezone_name(),
+    })
 
 
 @api.post("/projects/<project_id>/schedules")
 def create_schedule(project_id: str):
+    from engine.cron import (get_timezone, local_timezone_name,
+                             next_fire_timestamp, parse_cron)
     data = _payload()
     cron = (data.get("cron") or "").strip()
-    from engine.cron import parse_cron
     try:
         parse_cron(cron)
     except ValueError as exc:
         return _err(str(exc))
+    tz_name = (data.get("timezone") or local_timezone_name()).strip()
+    try:
+        get_timezone(tz_name)
+    except ValueError as exc:
+        return _err(str(exc))
+    policy = data.get("misfire_policy") or "catch_up"
+    if policy not in MISFIRE_POLICIES:
+        return _err(f"未知的错过补偿策略: {policy}（可选: {', '.join(MISFIRE_POLICIES)}）")
+    now_ts = time.time()
     schedule = {
         "id": new_id("sch"),
         "project_id": project_id,
         "name": data.get("name", "定时任务"),
         "cron": cron,
+        "timezone": tz_name,
+        "misfire_policy": policy,
         "suite_id": data.get("suite_id"),
         "env_id": data.get("env_id"),
         "enabled": bool(data.get("enabled", True)),
-        "last_fired_minute": None,
-        "created_at": time.time(),
+        "next_fire_at": next_fire_timestamp(cron, tz_name, now_ts),
+        "last_fired_at": None,
+        "created_at": now_ts,
     }
     _store("schedules").insert(schedule)
-    schedule["description"] = _scheduler().describe_cron(cron)
-    return jsonify(schedule)
+    return jsonify(_enrich_schedule(schedule))
 
 
 @api.put("/schedules/<schedule_id>")
 def update_schedule(schedule_id: str):
+    from engine.cron import get_timezone, next_fire_timestamp, parse_cron
     sched = _store("schedules").get(schedule_id)
     if sched is None:
         return _err("定时任务不存在", 404)
     data = _payload()
-    patch = {k: data[k] for k in ("name", "cron", "suite_id", "env_id", "enabled")
-             if k in data}
+    patch = {k: data[k] for k in ("name", "cron", "suite_id", "env_id", "enabled",
+                                  "timezone", "misfire_policy") if k in data}
     if "cron" in patch:
-        from engine.cron import parse_cron
         try:
             parse_cron(patch["cron"])
         except ValueError as exc:
             return _err(str(exc))
-        patch["last_fired_minute"] = None  # 修改表达式后重置触发标记
-    return jsonify(_store("schedules").update(schedule_id, patch))
+    if "timezone" in patch:
+        try:
+            get_timezone(patch["timezone"])
+        except ValueError as exc:
+            return _err(str(exc))
+    if "misfire_policy" in patch and patch["misfire_policy"] not in MISFIRE_POLICIES:
+        return _err(f"未知的错过补偿策略: {patch['misfire_policy']}"
+                    f"（可选: {', '.join(MISFIRE_POLICIES)}）")
+    if "cron" in patch or "timezone" in patch:
+        # 表达式或时区变了：以当前时刻为基准重算下次触发点，不追补旧计划
+        cron = patch.get("cron", sched.get("cron", ""))
+        tz_name = patch.get("timezone", sched.get("timezone") or "")
+        patch["next_fire_at"] = next_fire_timestamp(cron, tz_name, time.time())
+    updated = _store("schedules").update(schedule_id, patch)
+    return jsonify(_enrich_schedule(updated))
 
 
 @api.delete("/schedules/<schedule_id>")
@@ -641,6 +686,15 @@ def schedule_runs(schedule_id: str):
 def cron_describe():
     expr = request.args.get("expr", "")
     return jsonify({"expr": expr, "description": _scheduler().describe_cron(expr)})
+
+
+@api.get("/timezones")
+def list_timezones():
+    """常用 IANA 时区列表 + 服务器本地时区（供计划时区下拉框）。"""
+    from engine.cron import COMMON_TIMEZONES, local_timezone_name
+    local = local_timezone_name()
+    zones = sorted(set(COMMON_TIMEZONES) | {local})
+    return jsonify({"timezones": zones, "server_timezone": local})
 
 
 # ---------------------------------------------------------------------------

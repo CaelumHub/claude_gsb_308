@@ -1,7 +1,7 @@
 """调度器集成测试。
 
 覆盖：并发调度（构建池 + 用例池）、结果收集与聚合、报告/覆盖率/通知收尾、
-取消、以及定时任务的触发去重。
+取消、定时触发（到点触发、不重复、停机错过的补跑 / 标记策略）。
 """
 
 from __future__ import annotations
@@ -118,21 +118,125 @@ class TestSchedulerEndToEnd(unittest.TestCase):
         b = self.builds.for_project(pid).get(build_id)
         self.assertIn(b["status"], ("cancelled", "passed", "failed"))
 
-    def test_schedule_fires_once_per_minute(self):
-        pid, suite = self._setup_project(3)
-        cron = "* * * * *"  # 每分钟
+    # ---------------------------------------------------------- 定时触发
+    def _insert_schedule(self, pid, suite, **overrides):
         sch = {
-            "id": "sch_1", "project_id": pid, "name": "每分", "cron": cron,
+            "id": "sch_1", "project_id": pid, "name": "定时", "cron": "* * * * *",
+            "timezone": "UTC", "misfire_policy": "catch_up",
             "suite_id": suite["id"], "env_id": suite["env_id"], "enabled": True,
-            "last_fired_minute": None,
+            "next_fire_at": None, "last_fired_at": None,
         }
+        sch.update(overrides)
         self.registry.store("schedules").insert(sch)
-        self.sched.start()
-        # 直接调用一次扫描，再立即调用一次，同分钟只应触发一次
-        self.sched._scan_schedules()
-        self.sched._scan_schedules()
-        runs = self.registry.store("schedule_runs").query(where=[("schedule_id", "eq", sch["id"])])
+        return sch
+
+    def _runs_of(self, schedule_id):
+        return self.registry.store("schedule_runs").query(
+            where=[("schedule_id", "eq", schedule_id)])
+
+    def test_schedule_fires_once_when_due(self):
+        """到点触发一次；紧接着再扫不会重复触发。"""
+        pid, suite = self._setup_project(3)
+        now = time.time()
+        sch = self._insert_schedule(pid, suite, next_fire_at=now - 1)
+        self.sched._scan_schedules(now_ts=now)
+        self.sched._scan_schedules(now_ts=now + 1)
+        runs = self._runs_of(sch["id"])
         self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["status"], "submitted")
+        self.assertEqual(runs[0]["scheduled_at"], now - 1)
+        # 触发点已推进到未来
+        updated = self.registry.store("schedules").get(sch["id"])
+        self.assertGreater(updated["next_fire_at"], now)
+        self.assertIsNotNone(updated["last_fired_at"])
+
+    def test_new_schedule_initializes_next_fire_without_firing(self):
+        """新计划（还没有 next_fire_at）首次扫描只落触发点，不补跑历史。"""
+        pid, suite = self._setup_project(3)
+        sch = self._insert_schedule(pid, suite)
+        now = time.time()
+        self.sched._scan_schedules(now_ts=now)
+        self.assertEqual(len(self._runs_of(sch["id"])), 0)
+        updated = self.registry.store("schedules").get(sch["id"])
+        self.assertIsNotNone(updated["next_fire_at"])
+        self.assertGreater(updated["next_fire_at"], now)
+
+    def test_not_due_schedule_is_untouched(self):
+        """未到点的计划不触发、不改触发点。"""
+        pid, suite = self._setup_project(3)
+        now = time.time()
+        future = now + 3600
+        sch = self._insert_schedule(pid, suite, next_fire_at=future)
+        self.sched._scan_schedules(now_ts=now)
+        self.assertEqual(len(self._runs_of(sch["id"])), 0)
+        updated = self.registry.store("schedules").get(sch["id"])
+        self.assertEqual(updated["next_fire_at"], future)
+
+    def test_misfire_catch_up_fires_once_and_records(self):
+        """停机错过：catch_up 策略恢复后立即补跑一次，并记录合并的错过数。"""
+        pid, suite = self._setup_project(3)
+        now = time.time()
+        # 「停机」一小时：每 10 分钟一次的计划错过约 6 次
+        sch = self._insert_schedule(pid, suite, cron="*/10 * * * *",
+                                    next_fire_at=now - 3600)
+        self.sched._scan_schedules(now_ts=now)
+        runs = self._runs_of(sch["id"])
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["status"], "caught_up")
+        self.assertGreaterEqual(runs[0]["missed_count"], 5)
+        self.assertIsNotNone(runs[0]["build_id"])
+        # 只补跑一次：构建数恰为 1，触发来源标记为 schedule_catchup
+        builds = self.builds.for_project(pid).list_builds()
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(builds[0]["trigger"], "schedule_catchup")
+        # 触发点推进到当前之后，再扫不会重复补跑
+        updated = self.registry.store("schedules").get(sch["id"])
+        self.assertGreater(updated["next_fire_at"], now)
+        self.sched._scan_schedules(now_ts=now + 1)
+        self.assertEqual(len(self._runs_of(sch["id"])), 1)
+
+    def test_misfire_mark_missed_records_without_firing(self):
+        """停机错过：mark_missed 策略不补跑，明确记录「已错过」。"""
+        pid, suite = self._setup_project(3)
+        now = time.time()
+        sch = self._insert_schedule(pid, suite, cron="*/10 * * * *",
+                                    misfire_policy="mark_missed",
+                                    next_fire_at=now - 3600)
+        self.sched._scan_schedules(now_ts=now)
+        runs = self._runs_of(sch["id"])
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["status"], "missed")
+        self.assertGreaterEqual(runs[0]["missed_count"], 5)
+        self.assertIsNone(runs[0]["build_id"])
+        # 没有提交任何构建
+        self.assertEqual(len(self.builds.for_project(pid).list_builds()), 0)
+        # 触发点推进，再扫不会重复标记
+        updated = self.registry.store("schedules").get(sch["id"])
+        self.assertGreater(updated["next_fire_at"], now)
+        self.sched._scan_schedules(now_ts=now + 1)
+        self.assertEqual(len(self._runs_of(sch["id"])), 1)
+
+    def test_disabled_schedule_never_fires(self):
+        pid, suite = self._setup_project(3)
+        now = time.time()
+        sch = self._insert_schedule(pid, suite, enabled=False, next_fire_at=now - 10)
+        self.sched._scan_schedules(now_ts=now)
+        self.assertEqual(len(self._runs_of(sch["id"])), 0)
+
+    def test_schedule_timezone_changes_fire_instant(self):
+        """同一 cron 在不同时区下算出的触发时刻不同（上海 9 点 = UTC 1 点）。"""
+        pid, suite = self._setup_project(3)
+        now = time.time()
+        sch = self._insert_schedule(pid, suite, cron="0 9 * * *",
+                                    timezone="Asia/Shanghai")
+        self.sched._scan_schedules(now_ts=now)
+        updated = self.registry.store("schedules").get(sch["id"])
+        nxt = updated["next_fire_at"]
+        self.assertIsNotNone(nxt)
+        # 触发时刻换算到 UTC 必须是 01:00（上海 09:00）
+        import datetime as _dt
+        utc_dt = _dt.datetime.fromtimestamp(nxt, _dt.timezone.utc)
+        self.assertEqual((utc_dt.hour, utc_dt.minute), (1, 0))
 
 
 if __name__ == "__main__":
