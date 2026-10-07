@@ -8,8 +8,10 @@
 - ``a,b,c``      枚举
 - ``n``          单个值
 
-匹配基于本地时间，用于定时任务的到点触发判定。调度循环每隔
-``TICK`` 秒调用一次 :func:`cron_matches`，判断某个计划此刻是否应当触发。
+匹配只针对「某个时区墙上时间的年月日时分」做纯逻辑判断，不关心时间属于
+哪个时区：调用方（:mod:`engine.tzsched`）先把计划时区的墙上整分传入，
+再由时区模块换算为 UTC 整分。调度循环每隔 ``TICK`` 秒按 UTC 整分水位线
+比对该计划应到的触发点（见 :class:`engine.scheduler.Scheduler`）。
 """
 
 from __future__ import annotations

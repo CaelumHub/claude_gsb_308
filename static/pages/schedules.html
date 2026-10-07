@@ -9,6 +9,8 @@
     .sch-item { border: 1px solid var(--border); border-radius: 9px; padding: 12px 14px; margin-bottom: 10px; }
     .cron-box { font-family: var(--mono); font-size: 13px; background: var(--surface-2);
       border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }
+    .fire-box { background: var(--primary-soft); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
+    .run-line { display:flex; gap:8px; align-items:center; font-size:12px; padding:2px 0; }
   </style>
 </head>
 <body>
@@ -17,14 +19,15 @@
 
   <main class="main">
     <h1 class="page-title">定时任务与触发</h1>
-    <p class="page-desc">用 cron 表达式配置定时自动执行测试，到点触发、同一分钟不重复。</p>
+    <p class="page-desc">每条计划可配置自己的时区，cron 按该时区墙上时间触发；页面同时展示计划时区与本地时间的下次触发点。停机错过后按策略补跑或标记。</p>
 
     <div class="card">
       <div class="row">
         <label style="margin:0 6px 0 0;align-self:center">项目</label>
         <select id="project-select" style="max-width:240px" onchange="switchProject(this.value)"></select>
         <span style="flex:1"></span>
-        <button class="btn" id="btn-new">新建定时任务</button>
+        <span class="muted" id="tz-banner" style="font-size:12px"></span>
+        <button class="btn" id="btn-new" style="margin-left:12px">新建定时任务</button>
       </div>
     </div>
 
@@ -36,12 +39,22 @@
 
       <section class="card" id="edit-card">
         <h2 id="edit-title">新建定时任务</h2>
-        <div><label>名称</label><input type="text" id="s-name" placeholder="每晚回归"></div>
+        <div><label>名称</label><input type="text" id="s-name" placeholder="上海下班前回归"></div>
         <div class="mt"><label>Cron 表达式（分 时 日 月 周）</label>
-          <input type="text" id="s-cron" value="*/10 * * * *" oninput="previewCron()" class="mono">
+          <input type="text" id="s-cron" value="0 18 * * 1-5" oninput="previewCron()" class="mono">
           <div class="mt muted" id="cron-desc" style="font-size:13px"></div>
-          <div class="mt muted" style="font-size:12px">示例：<span class="mono">0 2 * * *</span> 每天 2 点 ·
-            <span class="mono">*/15 * * * *</span> 每 15 分钟 · <span class="mono">0 9 * * 1</span> 每周一 9 点</div>
+          <div class="mt muted" style="font-size:12px">示例：<span class="mono">0 18 * * 1-5</span> 工作日 18 点 ·
+            <span class="mono">*/15 * * * *</span> 每 15 分钟 · <span class="mono">0 9 * * 1</span> 每周一 9 点
+            （时间均按下方所选时区解释）</div>
+        </div>
+        <div class="grid cols-2 mt">
+          <div><label>时区（cron 按此时区解释）</label><select id="s-tz"></select></div>
+          <div><label>停机错过策略</label>
+            <select id="s-misfire">
+              <option value="run_once">补跑一次（最近一次）+ 其余标记错过</option>
+              <option value="mark_missed">不补跑，仅标记为已错过</option>
+            </select>
+          </div>
         </div>
         <div class="grid cols-2 mt">
           <div><label>目标套件</label><select id="s-suite"></select></div>
@@ -68,14 +81,52 @@ renderNav("schedules");
 let projectId = null;
 let schedules = [];
 let editingId = null;
+let tzInfo = { default: "UTC", common: [], all: [] };
+
+const MISFIRE_LABELS = {
+  run_once: "停机后补跑最近一次，其余标记错过",
+  mark_missed: "停机后不补跑，仅标记错过",
+};
+const RUN_LABELS = {
+  on_time: ["正常触发", "blue"], catchup: ["停机补跑", "violet"],
+  missed: ["已错过", "pending"], error: ["触发失败", "error"],
+  submitted: ["已提交", "blue"],
+};
 
 async function init() {
   const params = new URLSearchParams(location.search);
   projectId = await fillProjectSelect($("#project-select"), params.get("project_id"));
-  await Promise.all([loadSchedules(), loadRefs()]);
+  tzInfo = await api("/api/timezones");
+  fillTzSelect();
+  $("#tz-banner").textContent =
+    `服务器/默认时区：${esc(tzInfo.default)} · 你的浏览器时区：${browserTz()}`;
+  if (projectId) await Promise.all([loadSchedules(), loadRefs()]);
 }
 
-async function switchProject(id) { projectId = id; editingId = null; await Promise.all([loadSchedules(), loadRefs()]); }
+function browserTz() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "本地"; }
+  catch (e) { return "本地"; }
+}
+
+function fillTzSelect() {
+  const sel = $("#s-tz");
+  const def = tzInfo.default || "UTC";
+  const common = new Set(tzInfo.common || []);
+  const others = (tzInfo.all || []).filter(t => !common.has(t));
+  const group = (label, list) =>
+    `<optgroup label="${label}">` +
+    list.map(t => `<option value="${esc(t)}">${esc(t)}</option>`).join("") +
+    `</optgroup>`;
+  sel.innerHTML =
+    group("默认", [def]) +
+    group("常用时区", tzInfo.common || []) +
+    group("全部时区", others);
+}
+
+async function switchProject(id) {
+  projectId = id; editingId = null;
+  await Promise.all([loadSchedules(), loadRefs()]);
+}
 
 async function loadRefs() {
   const [suites, envs] = await Promise.all([
@@ -88,6 +139,37 @@ async function loadRefs() {
     (envs.environments||[]).map(e => `<option value="${e.id}">${esc(e.name)}</option>`).join("");
 }
 
+/* 秒级时间戳 -> 浏览器本地时间（带本地时区名） */
+function fmtLocal(epochSec) {
+  if (!epochSec) return "—";
+  const d = new Date(epochSec * 1000);
+  const tz = browserTz();
+  return `${d.toLocaleString("zh-CN", { hour12: false })} ${esc(tz)}`;
+}
+
+function nextFireHtml(s) {
+  const nf = s.next_fire;
+  if (!nf) return `<span class="muted">下次触发：该表达式在该时区没有可触发时间</span>`;
+  const dstTag = nf.dst
+    ? `<span class="badge ${nf.dst_adjusted ? "violet" : "pending"}" title="该时刻处于夏令时">夏令时${nf.dst_adjusted ? "·时间已调整" : ""}</span>`
+    : "";
+  return `<div class="fire-box">
+      <div>🕓 计划时区：<strong>${esc(nf.text)}</strong> ${esc(nf.weekday)}
+        <span class="muted">${esc(s.timezone)}（${esc(nf.offset)} ${esc(nf.tz_abbr)}）</span> ${dstTag}</div>
+      <div class="muted mt" style="font-size:12px">🏠 你的本地时间：${fmtLocal(nf.epoch)}</div>
+    </div>`;
+}
+
+function runLine(r) {
+  const [label, cls] = RUN_LABELS[r.status] || [r.status, "pending"];
+  const text = r.scheduled_local
+    ? `${esc(r.scheduled_local)} ${esc(r.scheduled_tz || "")}`
+    : fmtTime(r.fired_at);
+  const note = r.note ? `<span class="muted">— ${esc(r.note)}</span>` : "";
+  return `<div class="run-line"><span class="badge ${cls}">${label}</span>
+    <span class="mono">${text}</span>${note}</div>`;
+}
+
 async function loadSchedules() {
   const d = await api(`/api/projects/${projectId}/schedules`);
   schedules = d.schedules || [];
@@ -97,25 +179,30 @@ async function loadSchedules() {
     <div class="sch-item">
       <div class="row spread">
         <div class="row"><strong>${esc(s.name)}</strong>
-          <span class="badge ${s.enabled?'blue':'pending'}">${s.enabled?'已启用':'已停用'}</span></div>
+          <span class="badge ${s.enabled?'blue':'pending'}">${s.enabled?'已启用':'已停用'}</span>
+          <span class="badge pending" title="cron 按此时区解释">${esc(s.timezone)}</span></div>
         <div class="row">
           <button class="btn small secondary" onclick="toggle('${s.id}', ${!s.enabled})">${s.enabled?'停用':'启用'}</button>
           <button class="btn small secondary" onclick="editSch('${s.id}')">编辑</button>
           <button class="btn small danger" onclick="delSch('${s.id}')">删除</button>
         </div>
       </div>
-      <div class="cron-box mt">${esc(s.cron)}</div>
-      <div class="mt muted" style="font-size:13px">${esc(s.description||"")}</div>
-      <div class="mt" style="font-size:12px;color:var(--text-muted)">上次触发: ${s.last_fired_minute?esc(s.last_fired_minute):"—"} ·
-        最近执行: ${(s.recent_runs||[]).length} 次</div>
+      <div class="cron-box mt">${esc(s.cron)} <span class="muted">· ${esc(s.description||"")}</span></div>
+      <div class="mt">${s.enabled ? nextFireHtml(s)
+        : '<span class="muted" style="font-size:13px">已停用，停用期间不计算错过、恢复后从当前时间继续</span>'}</div>
+      <div class="mt muted" style="font-size:12px">停机错过策略：${esc(MISFIRE_LABELS[s.misfire_policy] || s.misfire_policy)}</div>
+      <div class="mt">${(s.recent_runs||[]).length ? (s.recent_runs||[]).map(runLine).join("")
+        : '<span class="muted" style="font-size:12px">暂无触发记录</span>'}</div>
     </div>`).join("");
 }
 
 function newSch() {
   editingId = null;
   $("#edit-title").textContent = "新建定时任务";
-  $("#s-name").value = ""; $("#s-cron").value = "*/10 * * * *"; $("#s-enabled").checked = true;
+  $("#s-name").value = ""; $("#s-cron").value = "0 18 * * 1-5"; $("#s-enabled").checked = true;
   $("#s-suite").value = ""; $("#s-env").value = "";
+  $("#s-tz").value = "Asia/Shanghai"; if ($("#s-tz").selectedIndex < 0) $("#s-tz").value = tzInfo.default;
+  $("#s-misfire").value = "run_once";
   previewCron();
 }
 
@@ -124,14 +211,17 @@ function editSch(id) {
   if (!s) return;
   editingId = id;
   $("#edit-title").textContent = "编辑定时任务";
-  $("#s-name").value = s.name || ""; $("#s-cron").value = s.cron || ""; $("#s-enabled").checked = s.enabled !== false;
+  $("#s-name").value = s.name || ""; $("#s-cron").value = s.cron || "";
+  $("#s-enabled").checked = s.enabled !== false;
   $("#s-suite").value = s.suite_id || ""; $("#s-env").value = s.env_id || "";
+  $("#s-tz").value = s.timezone || tzInfo.default;
+  $("#s-misfire").value = s.misfire_policy || "run_once";
   previewCron();
 }
 
 async function toggle(id, enabled) {
   await api(`/api/schedules/${id}`, { method: "PUT", body: { enabled } });
-  toast(enabled ? "已启用" : "已停用");
+  toast(enabled ? "已启用（从当前时间继续，不回补）" : "已停用");
   loadSchedules();
 }
 
@@ -144,13 +234,21 @@ async function delSch(id) {
 
 async function previewCron() {
   const expr = $("#s-cron").value.trim();
+  const tz = $("#s-tz").value;
   if (!expr) { $("#cron-desc").textContent = ""; return; }
   try {
-    const d = await api(`/api/cron/describe?expr=${encodeURIComponent(expr)}`);
-    $("#cron-desc").textContent = "含义：" + d.description;
+    const d = await api(`/api/cron/describe?expr=${encodeURIComponent(expr)}&timezone=${encodeURIComponent(tz)}`);
+    let msg = "含义：" + d.description;
+    if (d.next_fire) {
+      msg += `　|　下次触发：${d.next_fire.text} ${d.next_fire.weekday}（${d.next_fire.offset}）`
+        + (d.next_fire.dst_adjusted ? " · 夏令时调整" : "")
+        + `　本地：${fmtLocal(d.next_fire.epoch)}`;
+    }
+    $("#cron-desc").textContent = msg;
   } catch (e) { $("#cron-desc").textContent = "表达式无效"; }
 }
 
+$("#s-tz").onchange = previewCron;
 $("#btn-new").onclick = newSch;
 $("#btn-cancel").onclick = () => { editingId = null; };
 
@@ -159,8 +257,11 @@ $("#btn-save").onclick = async () => {
   if (!cron) return toast("请输入 cron 表达式", "error");
   const suiteId = $("#s-suite").value;
   if (!suiteId) return toast("请选择目标套件", "error");
-  const body = { name: $("#s-name").value || "定时任务", cron, suite_id: suiteId,
-    env_id: $("#s-env").value || null, enabled: $("#s-enabled").checked };
+  const body = {
+    name: $("#s-name").value || "定时任务", cron, suite_id: suiteId,
+    env_id: $("#s-env").value || null, enabled: $("#s-enabled").checked,
+    timezone: $("#s-tz").value, misfire_policy: $("#s-misfire").value,
+  };
   try {
     if (editingId) {
       await api(`/api/schedules/${editingId}`, { method: "PUT", body });

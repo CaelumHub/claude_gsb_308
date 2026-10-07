@@ -118,12 +118,15 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
     registry.store("schedules").insert({
         "id": new_id("sch"),
         "project_id": pid,
-        "name": "每 10 分钟跑一次冒烟",
-        "cron": "*/10 * * * *",
+        "name": "上海下班前跑一次冒烟",
+        "cron": "0 18 * * 1-5",
+        "timezone": "Asia/Shanghai",
+        "misfire_policy": "run_once",
         "suite_id": suite["id"],
         "env_id": env["id"],
         "enabled": False,
-        "last_fired_minute": None,
+        "baseline_epoch_minute": int(time.time()) // 60,
+        "last_fire_epoch_minute": int(time.time()) // 60,
         "created_at": time.time(),
     })
 

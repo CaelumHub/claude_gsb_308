@@ -9,8 +9,21 @@
    用例，用 ``max_case_workers`` 限制单构建内的并发度；结果通过
    :meth:`storage.buildstore.BuildStore.record_result` 在文件锁保护下
    并发安全地收集与聚合；
-3. **定时触发**：一个后台循环线程按 ``tick`` 间隔扫描启用的定时计划，
-   命中 cron 且本分钟尚未触发过就提交新构建，防止同一分钟重复触发。
+3. **时区定时触发**：一个后台循环线程按 ``tick`` 间隔扫描启用的计划。
+   每条计划有自己的 IANA 时区，cron 按「该时区墙上时间」解释；触发点用
+   UTC 整分标识，夏令时 gap/overlap 的处理规则见 :mod:`engine.tzsched`。
+
+停机补跑（misfire）
+-------------------
+扫描不看「这一分钟是否命中」，而是比对计划记录的水位线 ``last_fire_epoch``
+与当前应到的触发点，因此停机错过的触发点不会被悄悄跳过。恢复后按每条
+计划配置的 ``misfire_policy`` 处理：
+
+- ``run_once``：补跑一次（按最近错过的那一点提交构建），其余明确标记
+  为 ``missed``；
+- ``mark_missed``：不补跑，全部明确标记为 ``missed``。
+
+无论哪种策略，错过都有可查的运行记录，且每个触发点只处理一次。
 
 取消：每个构建持有一个 ``threading.Event``，用例执行器在步骤之间检查它，
 取消后已在跑或用例尽快中止、未跑的不再启动，最终构建标为 ``cancelled``。
@@ -24,8 +37,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
-from .cron import cron_matches, parse_cron
+from . import tzsched
+from .cron import parse_cron
 from .models import new_id
+
+# 一次停机最多为单条计划保留多少条 missed 明细；更多则折叠成一条汇总
+MISSED_RUN_CAP = 50
+
+_MISFIRE_POLICIES = ("run_once", "mark_missed")
 
 
 class Scheduler:
@@ -34,7 +53,7 @@ class Scheduler:
     def __init__(self, registry, build_registry, executor, env_manager,
                  report_gen, coverage_analyzer, defect_manager, notify_manager,
                  max_build_workers: int = 4, max_case_workers: int = 8,
-                 tick_seconds: float = 20.0):
+                 tick_seconds: float = 20.0, local_timezone: Optional[str] = None):
         self.registry = registry
         self.builds = build_registry
         self.executor = executor
@@ -47,6 +66,9 @@ class Scheduler:
         self.max_build_workers = max_build_workers
         self.max_case_workers = max_case_workers
         self.tick_seconds = tick_seconds
+
+        # 平台本地时区：旧计划（未配置时区）与新建计划默认值的基准。
+        self.local_timezone = local_timezone or tzsched.detect_local_timezone()
 
         self._build_pool = ThreadPoolExecutor(
             max_workers=max_build_workers, thread_name_prefix="build")
@@ -67,6 +89,11 @@ class Scheduler:
     def shutdown(self) -> None:
         self._stop_event.set()
         self._build_pool.shutdown(wait=False, cancel_futures=True)
+
+    def schedule_timezone(self, schedule: dict):
+        """取计划时区，未配置的旧计划回落到平台本地时区。"""
+        name = schedule.get("timezone") or self.local_timezone
+        return tzsched.get_timezone(name)
 
     # ------------------------------------------------------------------ 触发
     def submit_build(self, project_id: str, suite_id: str,
@@ -113,10 +140,6 @@ class Scheduler:
 
         self._build_pool.submit(
             self._run_build, project_id, build_id, cases, env_id, cancel_event)
-
-        # 若是定时触发，记录一次计划运行历史
-        if schedule_id:
-            self._record_schedule_run(schedule_id, project_id, build_id)
 
         return build
 
@@ -282,45 +305,197 @@ class Scheduler:
                 pass
             self._stop_event.wait(self.tick_seconds)
 
-    def _scan_schedules(self) -> None:
-        # 串行化扫描，避免多个线程（后台 tick + 手动触发）同时读到
-        # 「本分钟尚未触发」而重复触发同一计划。
+    def _scan_schedules(self, now_utc: Optional[datetime.datetime] = None) -> None:
+        """扫描所有计划并处理到点/错过的触发。
+
+        ``now_utc`` 仅用于测试注入；默认取当前 UTC 时刻。
+        """
+        # 串行化扫描，避免多个线程（后台 tick + 手动触发）同时越过水位线
+        # 而重复触发同一计划。
         with self._scan_lock:
-            self._scan_schedules_locked()
+            if now_utc is None:
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+            now_minute = int(now_utc.timestamp() // 60)
+            schedules_store = self.registry.store("schedules")
+            for schedule in schedules_store.all():
+                try:
+                    self._evaluate_schedule(schedule, now_minute, schedules_store)
+                except Exception:  # noqa: BLE001
+                    # 单条计划解析失败不影响其它计划
+                    continue
 
-    def _scan_schedules_locked(self) -> None:
-        now = datetime.datetime.now()
-        minute_key = now.strftime("%Y-%m-%d %H:%M")
-        schedules_store = self.registry.store("schedules")
-        for schedule in schedules_store.all():
-            if not schedule.get("enabled", True):
-                continue
-            if schedule.get("last_fired_minute") == minute_key:
-                continue  # 本分钟已触发过，防止同一分钟重复
-            try:
-                if cron_matches(schedule.get("cron", "* * * * *"), now):
-                    schedule["last_fired_minute"] = minute_key
-                    schedules_store.update(schedule["id"], {"last_fired_minute": minute_key})
-                    self.submit_build(
-                        schedule.get("project_id"),
-                        schedule.get("suite_id"),
-                        env_id=schedule.get("env_id"),
-                        trigger="schedule",
-                        schedule_id=schedule["id"],
-                    )
-            except ValueError:
-                continue
+    def _evaluate_schedule(self, schedule: dict, now_minute: int,
+                           schedules_store) -> None:
+        if not schedule.get("enabled", True):
+            return
+        sid = schedule["id"]
+        cron = parse_cron(schedule.get("cron", "* * * * *"))
+        tz = self.schedule_timezone(schedule)
+        policy = schedule.get("misfire_policy", "run_once")
+        if policy not in _MISFIRE_POLICIES:
+            policy = "run_once"
 
-    def _record_schedule_run(self, schedule_id: str, project_id: str,
-                             build_id: str) -> None:
+        # 首次见到该计划（新建 / 停用后重新启用 / 修改 cron 或时区后重置）：
+        # 以当前整分建立水位线，不回补历史。
+        baseline = schedule.get("baseline_epoch_minute")
+        if baseline is None:
+            schedules_store.update(sid, {
+                "baseline_epoch_minute": now_minute,
+                "last_fire_epoch_minute": now_minute,
+            })
+            return
+
+        watermark = schedule.get("last_fire_epoch_minute")
+        if watermark is None:
+            # 兼容只写了 baseline 的中间态
+            watermark = baseline
+        if now_minute <= watermark:
+            return
+
+        # 只逐点处理「最近」MAX_MISSED_PER_SCAN 个错过点；更早的折叠成一条
+        # 汇总。海量错过（如停机一年的每分钟计划）也不会长时间持锁、写爆库。
+        # 一次性枚举到当前整分：区间内严格落在过去的是错过点，落在当前整分
+        # 的是到点正常触发，二者用同一时区/夏令时模型，语义一致。
+        recent, total = tzsched.recent_fires_between(
+            cron, tz, watermark, now_minute,
+            max_recent=tzsched.MAX_MISSED_PER_SCAN + 1)
+        if recent and recent[-1][0] == now_minute:
+            current = recent[-1]
+            missed = recent[:-1]
+            total_missed = max(0, total - 1)
+        else:
+            current = None
+            missed = recent
+            total_missed = total
+
+        folded_older = total_missed - len(missed)
+        if not missed and current is None:
+            return
+
+        if missed:
+            self._handle_missed(schedule, missed, policy, tz,
+                                folded_older=folded_older)
+        if current is not None:
+            self._fire_occurrence(schedule, current, tz,
+                                  kind="on_time", trigger="schedule")
+
+        # 水位线推进到当前整分（正常到点）或最后一个已处理的错过点，
+        # 保证每个触发点只处理一次；折叠掉的更早点也一并越过。
+        advance_to = now_minute if current is not None else (
+            missed[-1][0] if missed else watermark)
+        schedules_store.update(sid, {"last_fire_epoch_minute": advance_to})
+
+    def _handle_missed(self, schedule: dict, missed: list, policy: str,
+                       tz, folded_older: int = 0) -> None:
+        """按策略处理一批错过的触发点（停机恢复后调用）。"""
+        total = len(missed) + folded_older
+        if folded_older:
+            # 更早、未逐点处理的错过：折叠成一条汇总，明确数量与时间范围
+            fold_note = (f"停机窗口过长，最早的 {folded_older} 次错过折叠为一条；"
+                         f"共错过约 {total} 次")
+            self._insert_run(
+                schedule, status="missed",
+                scheduled_epoch_minute=missed[0][0],
+                tz=tz, dst_adjusted=False, build_id=None, note=fold_note)
+        if policy == "run_once":
+            # 补跑一次：按最近错过的那一点补一场构建，其余标记 missed
+            catchup = missed[-1]
+            self._fire_occurrence(schedule, catchup, tz,
+                                  kind="catchup", trigger="schedule")
+            self._mark_missed_batch(schedule, missed[:-1], tz,
+                                    policy_note="已按策略补跑最近一次")
+        else:
+            # mark_missed：不补跑，全部明确标记
+            self._mark_missed_batch(schedule, missed, tz,
+                                    policy_note="按策略跳过，不补跑")
+
+    def _mark_missed_batch(self, schedule: dict, missed: list, tz,
+                           policy_note: str) -> None:
+        """把错过的触发点落为 missed 记录；超过上限的折叠成一条汇总。"""
+        total = len(missed)
+        if total > MISSED_RUN_CAP:
+            folded = total - MISSED_RUN_CAP
+            first_epoch = missed[0][0]
+            self._insert_run(
+                schedule, status="missed",
+                scheduled_epoch_minute=first_epoch, tz=tz,
+                dst_adjusted=missed[0][1], build_id=None,
+                note=f"另有 {folded} 次更早的错过记录已折叠；{policy_note}")
+            missed = missed[-MISSED_RUN_CAP:]
+        for epoch_minute, adjusted in missed:
+            self._insert_run(
+                schedule, status="missed",
+                scheduled_epoch_minute=epoch_minute, tz=tz,
+                dst_adjusted=adjusted, build_id=None, note=policy_note)
+
+    def _fire_occurrence(self, schedule: dict, occurrence: tuple, tz,
+                         kind: str, trigger: str) -> None:
+        """对单个触发点提交构建并落一条计划运行记录。
+
+        kind: ``on_time`` 正常到点 / ``catchup`` 停机恢复补跑。
+        """
+        epoch_minute, dst_adjusted = occurrence
+        note = None
+        if kind == "catchup":
+            wall = tzsched.wall_text(epoch_minute, tz)
+            note = f"停机恢复后补跑（计划时刻 {wall['text']} {wall['offset']}）"
+        result = self.submit_build(
+            schedule.get("project_id"),
+            schedule.get("suite_id"),
+            env_id=schedule.get("env_id"),
+            trigger=trigger,
+        )
+        if "id" in result:
+            self._insert_run(
+                schedule, status=kind,
+                scheduled_epoch_minute=epoch_minute, tz=tz,
+                dst_adjusted=dst_adjusted, build_id=result["id"], note=note)
+        else:
+            # 提交失败（套件/环境缺失等）也要留下记录，不能悄悄跳过
+            self._insert_run(
+                schedule, status="error",
+                scheduled_epoch_minute=epoch_minute, tz=tz,
+                dst_adjusted=dst_adjusted, build_id=None,
+                note=f"触发但提交构建失败: {result.get('error', '未知错误')}")
+
+    def _insert_run(self, schedule: dict, status: str,
+                    scheduled_epoch_minute: int, tz, dst_adjusted: bool,
+                    build_id: Optional[str], note: Optional[str]) -> None:
+        wall = tzsched.wall_text(scheduled_epoch_minute, tz)
         self.registry.store("schedule_runs").insert({
             "id": new_id("schrun"),
-            "schedule_id": schedule_id,
-            "project_id": project_id,
+            "schedule_id": schedule["id"],
+            "project_id": schedule.get("project_id"),
             "build_id": build_id,
+            "status": status,
+            "kind": status,
+            "scheduled_epoch": scheduled_epoch_minute * 60,
+            "scheduled_local": wall["text"],
+            "scheduled_tz": str(tz),
+            "dst_adjusted": dst_adjusted,
             "fired_at": time.time(),
-            "status": "submitted",
+            "note": note,
         })
+
+    # ------------------------------------------------------------------ 展示
+    def next_fire_info(self, schedule: dict) -> Optional[dict]:
+        """计算某条计划的下次触发点（计划时区 + 浏览器本地两套展示字段）。
+
+        严格晚于「当前 UTC 整分」；表达式在任何时区都无意义时返回 ``None``。
+        """
+        try:
+            cron = parse_cron(schedule.get("cron", ""))
+            tz = self.schedule_timezone(schedule)
+        except ValueError:
+            return None
+        now_minute = int(datetime.datetime.now(datetime.timezone.utc).timestamp() // 60)
+        nxt = tzsched.next_fire(cron, tz, now_minute)
+        if nxt is None:
+            return None
+        epoch_minute, dst_adjusted = nxt
+        wall = tzsched.wall_text(epoch_minute, tz)
+        wall["dst_adjusted"] = dst_adjusted
+        return wall
 
     def describe_cron(self, expr: str) -> str:
         """把 cron 表达式转成人话（供前端展示）。"""

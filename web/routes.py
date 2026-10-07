@@ -571,12 +571,17 @@ def resolve_environment(env_id: str):
 
 @api.get("/projects/<project_id>/schedules")
 def list_schedules(project_id: str):
+    scheduler = _scheduler()
     schedules = _store("schedules").query(where=[("project_id", "eq", project_id)],
                                           order_by="created_at", order="desc")
+    runs_store = _store("schedule_runs")
     for s in schedules:
-        s["description"] = _scheduler().describe_cron(s.get("cron", ""))
-        runs = _store("schedule_runs").query(where=[("schedule_id", "eq", s["id"])],
-                                             order_by="fired_at", order="desc", limit=10)
+        s["description"] = scheduler.describe_cron(s.get("cron", ""))
+        s["timezone"] = s.get("timezone") or scheduler.local_timezone
+        s["misfire_policy"] = s.get("misfire_policy", "run_once")
+        s["next_fire"] = scheduler.next_fire_info(s)
+        runs = runs_store.query(where=[("schedule_id", "eq", s["id"])],
+                                order_by="fired_at", order="desc", limit=10)
         s["recent_runs"] = runs
     return jsonify({"schedules": schedules})
 
@@ -586,23 +591,39 @@ def create_schedule(project_id: str):
     data = _payload()
     cron = (data.get("cron") or "").strip()
     from engine.cron import parse_cron
+    from engine import tzsched
     try:
         parse_cron(cron)
     except ValueError as exc:
         return _err(str(exc))
+    scheduler = _scheduler()
+    tz_name = (data.get("timezone") or scheduler.local_timezone).strip()
+    try:
+        tzsched.get_timezone(tz_name)
+    except ValueError as exc:
+        return _err(str(exc))
+    policy = data.get("misfire_policy", "run_once")
+    if policy not in ("run_once", "mark_missed"):
+        return _err("错过策略只能是 run_once（补跑一次）或 mark_missed（标记错过）")
+    # 以当前整分为基线水位线：新建计划不会回补历史触发点
+    baseline = int(time.time()) // 60
     schedule = {
         "id": new_id("sch"),
         "project_id": project_id,
         "name": data.get("name", "定时任务"),
         "cron": cron,
+        "timezone": tz_name,
+        "misfire_policy": policy,
         "suite_id": data.get("suite_id"),
         "env_id": data.get("env_id"),
         "enabled": bool(data.get("enabled", True)),
-        "last_fired_minute": None,
+        "baseline_epoch_minute": baseline,
+        "last_fire_epoch_minute": baseline,
         "created_at": time.time(),
     }
     _store("schedules").insert(schedule)
-    schedule["description"] = _scheduler().describe_cron(cron)
+    schedule["description"] = scheduler.describe_cron(cron)
+    schedule["next_fire"] = scheduler.next_fire_info(schedule)
     return jsonify(schedule)
 
 
@@ -612,7 +633,8 @@ def update_schedule(schedule_id: str):
     if sched is None:
         return _err("定时任务不存在", 404)
     data = _payload()
-    patch = {k: data[k] for k in ("name", "cron", "suite_id", "env_id", "enabled")
+    patch = {k: data[k] for k in ("name", "cron", "suite_id", "env_id", "enabled",
+                                  "timezone", "misfire_policy")
              if k in data}
     if "cron" in patch:
         from engine.cron import parse_cron
@@ -620,8 +642,30 @@ def update_schedule(schedule_id: str):
             parse_cron(patch["cron"])
         except ValueError as exc:
             return _err(str(exc))
-        patch["last_fired_minute"] = None  # 修改表达式后重置触发标记
-    return jsonify(_store("schedules").update(schedule_id, patch))
+    if "timezone" in patch:
+        from engine import tzsched
+        try:
+            tzsched.get_timezone(patch["timezone"])
+        except ValueError as exc:
+            return _err(str(exc))
+    if "misfire_policy" in patch and patch["misfire_policy"] not in (
+            "run_once", "mark_missed"):
+        return _err("错过策略只能是 run_once（补跑一次）或 mark_missed（标记错过）")
+
+    # 修改 cron / 时区，或从停用切回启用，都会改变触发节奏：重置水位线到
+    # 当前整分，避免恢复时把改动前的旧触发点当停机错过补出来。
+    resets_watermark = (
+        ("cron" in patch and patch["cron"] != sched.get("cron"))
+        or ("timezone" in patch and patch["timezone"] != sched.get("timezone"))
+        or (patch.get("enabled") and not sched.get("enabled", True))
+    )
+    if resets_watermark:
+        baseline = int(time.time()) // 60
+        patch["baseline_epoch_minute"] = baseline
+        patch["last_fire_epoch_minute"] = baseline
+
+    updated = _store("schedules").update(schedule_id, patch)
+    return jsonify(updated)
 
 
 @api.delete("/schedules/<schedule_id>")
@@ -640,7 +684,35 @@ def schedule_runs(schedule_id: str):
 @api.get("/cron/describe")
 def cron_describe():
     expr = request.args.get("expr", "")
-    return jsonify({"expr": expr, "description": _scheduler().describe_cron(expr)})
+    tz_name = request.args.get("timezone")
+    scheduler = _scheduler()
+    resp = {"expr": expr, "description": scheduler.describe_cron(expr)}
+    # 编辑表单里带时区时，顺带预览按该时区计算的下次触发点
+    if tz_name:
+        from engine import tzsched
+        from engine.cron import parse_cron
+        try:
+            cron = parse_cron(expr)
+            tz = tzsched.get_timezone(tz_name)
+            now_minute = int(time.time()) // 60
+            nxt = tzsched.next_fire(cron, tz, now_minute)
+            resp["next_fire"] = (tzsched.wall_text(nxt[0], tz)
+                                 | {"dst_adjusted": nxt[1]}) if nxt else None
+        except ValueError:
+            resp["next_fire"] = None
+    return jsonify(resp)
+
+
+@api.get("/timezones")
+def list_timezones():
+    """时区列表 + 平台本地时区（旧计划与新建计划的默认值）。"""
+    from engine import tzsched
+    scheduler = _scheduler()
+    return jsonify({
+        "default": scheduler.local_timezone,
+        "common": tzsched.COMMON_TIMEZONES,
+        "all": tzsched.list_timezones(),
+    })
 
 
 # ---------------------------------------------------------------------------

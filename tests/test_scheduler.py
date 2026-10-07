@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 import sys
 import tempfile
@@ -41,6 +42,10 @@ class TestSchedulerEndToEnd(unittest.TestCase):
         self.registry, self.builds, self.env_mgr, self.sched = _make_scheduler(self.tmp.name)
 
     def tearDown(self):
+        # 先等后台构建线程排空（它们仍在往临时目录写结果），再停调度与清目录
+        deadline = time.time() + 15
+        while time.time() < deadline and self.sched.running():
+            time.sleep(0.02)
         self.sched.shutdown()
         self.tmp.cleanup()
 
@@ -118,21 +123,171 @@ class TestSchedulerEndToEnd(unittest.TestCase):
         b = self.builds.for_project(pid).get(build_id)
         self.assertIn(b["status"], ("cancelled", "passed", "failed"))
 
-    def test_schedule_fires_once_per_minute(self):
-        pid, suite = self._setup_project(3)
-        cron = "* * * * *"  # 每分钟
+    def _insert_schedule(self, pid, suite, cron="* * * * *",
+                         timezone="UTC", misfire_policy="run_once",
+                         baseline=None, enabled=True, sid="sch_1"):
+        now_minute = int(time.time()) // 60
         sch = {
-            "id": "sch_1", "project_id": pid, "name": "每分", "cron": cron,
-            "suite_id": suite["id"], "env_id": suite["env_id"], "enabled": True,
-            "last_fired_minute": None,
+            "id": sid, "project_id": pid, "name": "定时", "cron": cron,
+            "timezone": timezone, "misfire_policy": misfire_policy,
+            "suite_id": suite["id"], "env_id": suite["env_id"],
+            "enabled": enabled,
+            "baseline_epoch_minute": baseline if baseline is not None else now_minute,
+            "last_fire_epoch_minute": baseline if baseline is not None else now_minute,
         }
         self.registry.store("schedules").insert(sch)
-        self.sched.start()
-        # 直接调用一次扫描，再立即调用一次，同分钟只应触发一次
-        self.sched._scan_schedules()
-        self.sched._scan_schedules()
-        runs = self.registry.store("schedule_runs").query(where=[("schedule_id", "eq", sch["id"])])
+        return sch
+
+    def _runs(self, sid):
+        return self.registry.store("schedule_runs").query(
+            where=[("schedule_id", "eq", sid)])
+
+    def test_schedule_fires_once_per_minute(self):
+        """当前整分命中即触发，同一分钟重复扫描不重复触发。"""
+        pid, suite = self._setup_project(3)
+        now_minute = int(time.time()) // 60
+        sch = self._insert_schedule(pid, suite, cron="* * * * *",
+                                    baseline=now_minute - 1)
+        now_utc = datetime.datetime.fromtimestamp(now_minute * 60,
+                                                  tz=datetime.timezone.utc)
+        self.sched._scan_schedules(now_utc=now_utc)
+        self.sched._scan_schedules(now_utc=now_utc)
+        runs = self._runs(sch["id"])
         self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["status"], "on_time")
+
+    def test_new_schedule_does_not_backfill(self):
+        """首次见到的计划以当前整分为基线，不回补历史。"""
+        pid, suite = self._setup_project(3)
+        sch = self._insert_schedule(pid, suite)  # baseline=now
+        self.sched._scan_schedules()
+        self.assertEqual(len(self._runs(sch["id"])), 0)
+        stored = self.registry.store("schedules").get(sch["id"])
+        self.assertIsNotNone(stored["baseline_epoch_minute"])
+
+    def test_fires_in_schedule_timezone_not_server_timezone(self):
+        """cron 按计划时区解释：上海 17:30 对应 UTC 09:30，UTC 17:30 不触发。"""
+        pid, suite = self._setup_project(3)
+        # 上海 17:30 = UTC 09:30
+        sh_fire = datetime.datetime(2026, 10, 7, 9, 30, tzinfo=datetime.timezone.utc)
+        baseline = int(sh_fire.timestamp()) // 60 - 1
+        sch = self._insert_schedule(pid, suite, cron="30 17 * * *",
+                                    timezone="Asia/Shanghai", baseline=baseline)
+        self.sched._scan_schedules(now_utc=sh_fire)
+        self.assertEqual(len(self._runs(sch["id"])), 1)
+
+        # UTC 17:30（上海已是次日 01:30）对「上海 17:30」不应触发
+        pid2, suite2 = self._setup_project(3)
+        other = datetime.datetime(2026, 10, 7, 17, 30, tzinfo=datetime.timezone.utc)
+        sch2 = self._insert_schedule(pid2, suite2, cron="30 17 * * *",
+                                     timezone="Asia/Shanghai",
+                                     baseline=int(other.timestamp()) // 60 - 1,
+                                     sid="sch_2")
+        self.sched._scan_schedules(now_utc=other)
+        self.assertEqual(len(self._runs(sch2["id"])), 0)
+
+    def test_misfire_run_once_catches_up_and_marks_rest(self):
+        """停机错过多个点（run_once）：补跑最近一次，其余明确标记 missed。"""
+        pid, suite = self._setup_project(3)
+        # 每分钟计划，水位线停在 3 分钟前 -> 错过 2 个过去点 + 1 个当前点
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(
+            second=0, microsecond=0)
+        now_minute = int(now_utc.timestamp()) // 60
+        sch = self._insert_schedule(pid, suite, cron="* * * * *",
+                                    misfire_policy="run_once",
+                                    baseline=now_minute - 3)
+        self.sched._scan_schedules(now_utc=now_utc)
+        runs = self._runs(sch["id"])
+        statuses = sorted(r["status"] for r in runs)
+        self.assertEqual(statuses, ["catchup", "missed", "on_time"])
+        catchup = next(r for r in runs if r["status"] == "catchup")
+        self.assertTrue(catchup["build_id"])
+        self.assertIn("补跑", catchup["note"])
+        missed = next(r for r in runs if r["status"] == "missed")
+        self.assertIsNone(missed["build_id"])
+        # 水位线推进，再次扫描不会重复处理
+        self.sched._scan_schedules(now_utc=now_utc)
+        self.assertEqual(len(self._runs(sch["id"])), 3)
+
+    def test_misfire_mark_missed_does_not_build(self):
+        """停机错过多个点（mark_missed）：不补跑，全部标记 missed。"""
+        pid, suite = self._setup_project(3)
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(
+            second=0, microsecond=0)
+        now_minute = int(now_utc.timestamp()) // 60
+        sch = self._insert_schedule(pid, suite, cron="* * * * *",
+                                    misfire_policy="mark_missed",
+                                    baseline=now_minute - 3)
+        self.sched._scan_schedules(now_utc=now_utc)
+        runs = self._runs(sch["id"])
+        statuses = sorted(r["status"] for r in runs)
+        self.assertEqual(statuses, ["missed", "missed", "on_time"])
+        self.assertTrue(all(r["build_id"] is None
+                            for r in runs if r["status"] == "missed"))
+
+    def test_dst_gap_shifts_and_dedups(self):
+        """春令时 gap：02:30 不存在，落到 03:30 EDT 并标记 dst_adjusted。"""
+        from engine.cron import parse_cron
+        from engine import tzsched
+        ny = tzsched.get_timezone("America/New_York")
+        # 2026-03-08 02:30 (不存在) -> 03:30 EDT = 07:30 UTC
+        fire = datetime.datetime(2026, 3, 8, 7, 30, tzinfo=datetime.timezone.utc)
+        baseline = int(fire.timestamp()) // 60 - 60
+        pid, suite = self._setup_project(3)
+        sch = self._insert_schedule(pid, suite, cron="30 2 * * *",
+                                    timezone="America/New_York",
+                                    baseline=baseline)
+        self.sched._scan_schedules(now_utc=fire)
+        runs = self._runs(sch["id"])
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0]["dst_adjusted"])
+        self.assertEqual(runs[0]["scheduled_local"], "2026-03-08 03:30")
+
+        # */30 在 gap 内的 02:00/02:30 不重复触发（03:00 只一次）
+        pid2, suite2 = self._setup_project(3)
+        sch2 = self._insert_schedule(pid2, suite2, cron="*/30 * * * *",
+                                     timezone="America/New_York",
+                                     baseline=baseline, sid="sch_2")
+        at_gap_end = datetime.datetime(2026, 3, 8, 7, 0,
+                                       tzinfo=datetime.timezone.utc)
+        self.sched._scan_schedules(now_utc=at_gap_end)
+        runs2 = self._runs("sch_2")
+        gap_runs = [r for r in runs2 if r["scheduled_local"] == "2026-03-08 03:00"]
+        self.assertEqual(len(gap_runs), 1)
+
+    def test_dst_overlap_fires_twice(self):
+        """秋令时 overlap：01:30 出现两次（EDT 与 EST），各触发一次。"""
+        # 2026-11-01 01:30 EDT = 05:30 UTC; 01:30 EST = 06:30 UTC
+        first = datetime.datetime(2026, 11, 1, 5, 30, tzinfo=datetime.timezone.utc)
+        second = datetime.datetime(2026, 11, 1, 6, 30, tzinfo=datetime.timezone.utc)
+        baseline = int(first.timestamp()) // 60 - 60
+        pid, suite = self._setup_project(3)
+        sch = self._insert_schedule(pid, suite, cron="30 1 * * *",
+                                    timezone="America/New_York",
+                                    baseline=baseline)
+        # 第一次到点
+        self.sched._scan_schedules(now_utc=first)
+        runs = self._runs(sch["id"])
+        self.assertEqual(len(runs), 1)
+        self.assertFalse(runs[0]["dst_adjusted"])
+        # 走到两次出现之间（06:00 UTC）不应重放第一次
+        self.sched._scan_schedules(
+            now_utc=datetime.datetime(2026, 11, 1, 6, 0,
+                                      tzinfo=datetime.timezone.utc))
+        self.assertEqual(len(self._runs(sch["id"])), 1)
+        # 第二次到点
+        self.sched._scan_schedules(now_utc=second)
+        runs = self._runs(sch["id"])
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(len({r["scheduled_epoch"] for r in runs}), 2)
+
+    def test_disabled_schedule_skipped(self):
+        pid, suite = self._setup_project(3)
+        now_minute = int(time.time()) // 60
+        sch = self._insert_schedule(pid, suite, baseline=now_minute - 5,
+                                    enabled=False)
+        self.sched._scan_schedules()
+        self.assertEqual(len(self._runs(sch["id"])), 0)
 
 
 if __name__ == "__main__":
